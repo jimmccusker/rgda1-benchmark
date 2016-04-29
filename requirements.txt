@@ -1,0 +1,3 @@
+mrjob
+boto
+git+https://github.com/jimmccusker/rdflib.git
