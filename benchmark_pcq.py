@@ -23,13 +23,13 @@ def download(url):
        in chunks and print out how much remains
     """
 
-    baseFile = os.path.basename(url)
+    baseFile = '_'.join(url.split('/')[-4:]) #os.path.basename(url)
 
     #move the file to a more uniq path
     os.umask(0002)
-    temp_path = "/tmp/"
-    file = os.path.join(temp_path,baseFile)
-    file_exists = os.path.isfile(file)
+    temp_path = "/data/"
+    f = os.path.join(temp_path,baseFile)
+    file_exists = os.path.isfile(f)
     
     if not file_exists:
         sys.stderr.write("Downloading %s from the web\n"%url)
@@ -38,13 +38,14 @@ def download(url):
             total_size = int(req.info().getheader('Content-Length').strip())
             downloaded = 0
             CHUNK = 256 * 10240
-            with open(file, 'wb') as fp:
+            with open(f+".download", 'wb') as fp:
                 while True:
                     chunk = req.read(CHUNK)
                     downloaded += len(chunk)
                     #print math.floor( (downloaded / total_size) * 100 )
                     if not chunk: break
                     fp.write(chunk)
+            shutil.move(f+".download", f)
         except urllib2.HTTPError, e:
             sys.stderr.write("HTTP Error: %s %s\n"%(e.code , url))
             return False
@@ -54,7 +55,7 @@ def download(url):
         sys.stderr.write("Downloaded %s from the web\n"%url)
 
     sys.stderr.write("File ready: %s\n"%url)
-    return file
+    return f
 
 stat_cols = [
     'id',
@@ -74,15 +75,16 @@ stat_cols = [
     'error',
     ]
 
-def digest_graph(uri, graph):
+def digest_graph(uri, turtle):
     stats = collections.defaultdict(str)
     stats["id"] = uri
     #stats['lines'] = len(nquads.split('\n'))
     #sys.stderr.flush()
     try:
         g = ConjunctiveGraph()
-        g += graph#.parse(data=nquads, format="nquads")
-        sys.stderr.write("Processing %s (%d)...\n"%(uri, len(g)))
+        g.parse(data=turtle, format="turtle")
+        #sys.stderr.write("Processing %s (%d)...\n"%(uri, len(g)))
+        sys.stderr.write('.')
         sys.stderr.flush()
         stats['ontology'] = g.value(predicate=RDF.type, object=OWL.Class) is not None
         ig = to_isomorphic(g)
@@ -93,27 +95,28 @@ def digest_graph(uri, graph):
         sys.stderr.flush()
         stats['error'] = str(e)
         #print nquads
-    return [str(stats[c]) for c in stat_cols]
+    return [unicode(stats[c]).encode("ascii","ignore") for c in stat_cols]
 
 def segment_graphs(url):
     if ".nq" not in url:
         return
     local_file = download(url)
-    statements = gzip.GzipFile(fileobj=open(local_file, 'rb'))
-
+    store_dir = "/mnt"+local_file+".triplestore"
+    store_exists = os.path.isdir(store_dir)
     graph = ConjunctiveGraph('Sleepycat')
     # first time create the store:
-    graph.open(local_file+".triplestore", create = True)
-    for line in gzip.GzipFile(fileobj=open(local_file, 'rb')):
-        try:
-            graph.parse(data=line, format="nquads")
-        except Exception as e:
-            sys.stderr.write("ERROR: %s %s\n"%(line, e))
-            sys.stderr.flush()
+    graph.open(store_dir, create = True)
+    if not store_exists:
+        statements = gzip.GzipFile(fileobj=open(local_file, 'rb'))
+        for line in statements:
+            try:
+                graph.parse(data=line, format="nquads")
+            except Exception as e:
+                sys.stderr.write("ERROR: %s %s\n"%(line, e))
+                sys.stderr.flush()
 
-    return graph.contexts()
-    
-NUMBER_OF_PROCESSES = cpu_count() - 1
+        print "Loaded", store_dir
+    return graph.contexts(), store_dir
 
 submitted = Event()
 processed = Event()
@@ -121,10 +124,12 @@ processed = Event()
 def work(id, jobs, result):
     while True:
         try:
-            graph = jobs.get(timeout=10)
-            uri = graph.identifier
-            print uri
-            stats_line = digest_graph(uri, graph)
+            turtle, uri = jobs.get(timeout=10)
+            #graph = ConjunctiveGraph('Sleepycat', identifier=uri)
+            # first time create the store:
+            #graph.open(path)
+            #print uri
+            stats_line = digest_graph(uri, turtle)
             result.put(stats_line)
             jobs.task_done()
         except Empty:
@@ -133,9 +138,16 @@ def work(id, jobs, result):
                 break
 
 def read(jobs, file_list):
-    for url in open(file_list):
-        for job in segment_graphs(url.strip()):
-            jobs.put(job, True)
+    for url in file_list:
+        contexts, path = segment_graphs(url.strip())
+        print "Submitting contexts for", path
+        for context in contexts:
+            try:
+                jobs.put((context.serialize(format="turtle"), context.identifier), True)
+            except Exception as e:
+                sys.stderr.write("ERROR: %s %s\n"%(context.identifier, e))
+                sys.stderr.flush()
+        
     submitted.set()
 
 def process_one(uri):
@@ -165,14 +177,22 @@ def main(file_list, outputFile):
     jobs = JoinableQueue(10000)
     result = JoinableQueue()
 
-    Process(target=read, args=(jobs, file_list)).start()
+    loader_processes = 3
+    NUMBER_OF_PROCESSES = cpu_count() - loader_processes
+    files = [ [] for x in range(loader_processes)]
+    for i, f in enumerate(open(file_list)):
+        files[i%loader_processes].append(f)
+
+    for i in range(loader_processes):
+        Process(target=read, args=(jobs, files[i])).start()
 
     for i in xrange(NUMBER_OF_PROCESSES):
         p = Process(target=work, args=(i, jobs, result))
         p.daemon = True
         p.start()
 
-    o = csv.writer(open(outputFile, 'a'), delimiter=',')
+    o = csv.writer(open(outputFile, 'w'), delimiter=',')
+    o.writerow(stat_cols)
     while not submitted.is_set() and not processed.is_set():
         row = result.get()
         o.writerow(row)
